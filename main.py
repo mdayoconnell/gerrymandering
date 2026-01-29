@@ -16,8 +16,8 @@ Calculating gerrymandered districts using a monte carlo simulation
 '''
 
 from ml_dtypes import uint4
-from init import initialize_map
-from evaluate import evaluate_flip, check_connectivity
+from maps.init_squareland import initialize_map
+from model.evaluate import evaluate_flip, check_connectivity
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
@@ -134,14 +134,8 @@ def flip(candidate, candidate_score, district_masks):
     new_masks[current_district][i, j] = 0
     new_masks[target_district][i, j] = 1
 
-    # Check connectivity for both affected districts
-    if not (check_connectivity(new_masks[current_district]) and check_connectivity(new_masks[target_district])):
-        print("Flip would break district continuity. Rejected.")
+    if not continuity_check_and_evaluate(candidate, current_district, target_district, new_masks):
         return district_masks
-
-    # Commit the flip
-    print(f"Flip confirmed: pixel {candidate} moved from district {current_district} to {target_district}.")
-    evaluate_flip(candidate, target_district)
     return new_masks
     gc.collect()
 
@@ -151,7 +145,14 @@ def determine_flip_probability(candidate_score, max_score=20.0):
     if candidate_score >= max_score:
         return 1.0
     return candidate_score / max_score
-# TODO: Add continuity check and evaluation
+
+def continuity_check_and_evaluate(candidate, current_district, target_district, new_masks):
+    if not (check_connectivity(new_masks[current_district]) and check_connectivity(new_masks[target_district])):
+        print("Flip would break district continuity. Rejected.")
+        return False
+    print(f"Flip confirmed: pixel {candidate} moved from district {current_district} to {target_district}.")
+    evaluate_flip(candidate, target_district)
+    return True
 
 
 def update(frame):

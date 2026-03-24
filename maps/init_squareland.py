@@ -297,6 +297,54 @@ def visualize_districts(district_masks, centers, ax=None, show_colorbar: bool = 
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
 
+def launch_map_overview(
+    pops: np.ndarray,
+    swing: np.ndarray,
+    district_masks,
+    centers: np.ndarray,
+    electoral_total_ev: int = 100,
+):
+    """
+    Render a compact 2x2 overview of the current map state.
+    """
+    labels = district_indices_from_masks(district_masks)
+    num_districts = int(labels.max()) + 1
+    district_pop, _, district_mean = compute_district_stats(pops, swing, labels, num_districts)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    plt.subplots_adjust(hspace=0.35, wspace=0.25)
+    population_ax, swing_ax = axes[0]
+    outcome_ax, districts_ax = axes[1]
+
+    population_im = population_ax.imshow(pops, cmap="viridis", vmin=0, vmax=1)
+    population_ax.set_title("Population (normalized)")
+    population_ax.set_xticks([])
+    population_ax.set_yticks([])
+    overlay_district_boundaries(population_ax, labels)
+    plt.colorbar(population_im, ax=population_ax, fraction=0.046, pad=0.04)
+
+    swing_im = swing_ax.imshow(swing, cmap="bwr", vmin=-1, vmax=1)
+    swing_ax.set_title("Swing (-1 red, +1 blue)")
+    swing_ax.set_xticks([])
+    swing_ax.set_yticks([])
+    overlay_district_boundaries(swing_ax, labels)
+    plt.colorbar(swing_im, ax=swing_ax, fraction=0.046, pad=0.04)
+
+    visualize_electoral_college_bar(
+        district_pop=district_pop,
+        district_mean_swing=district_mean,
+        ax=outcome_ax,
+        total_ev=electoral_total_ev,
+        show_numbers=True,
+        total_population=float(np.sum(pops)),
+    )
+
+    visualize_districts(district_masks, centers, ax=districts_ax, show_colorbar=False)
+    districts_ax.set_title("District Labels")
+
+    return fig, axes
+
+
 def main(
     show_population: bool = True,
     show_swing: bool = True,

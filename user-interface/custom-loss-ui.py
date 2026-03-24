@@ -119,13 +119,7 @@ def launch_loss_weight_sliders(
 
 
 if __name__ == "__main__":
-    printing = (input("Print weight changes? (Y/N)") == "Y" or "y") 
-    def _print_weights(weights: LossWeights) -> None:
-        print(weights)
-
-    if printing:
-        _fig, _sliders = launch_loss_weight_sliders(on_change=_print_weights )
-    else:
-        _fig, _sliders = launch_loss_weight_sliders()
+    
+    _fig, _sliders = launch_loss_weight_sliders()
     
     plt.show()

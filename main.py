@@ -1,185 +1,322 @@
-# Created by Micah
-# Date: 7/31/25
-# Time: 10:18 PM
-# Project: Gerrymandering
-# File: main.py
+from __future__ import annotations
 
-'''
+from dataclasses import asdict
+import math
 
-"Redistricting is like an election in reverse. Instead of letting the
-voters pick the politicians, the politicians pick the voters!"
-
-- Thomas Hoeffeler
-
-Calculating gerrymandered districts using a monte carlo simulation
-
-'''
-
-from ml_dtypes import uint4
-from maps.init_squareland import initialize_map
-from model.evaluate import evaluate_flip, check_connectivity
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import numpy as np
-import gc
 from scipy.signal import convolve2d
-import matplotlib.animation as animation
 
-def visualize_districts(district_masks, centers):
-# ---
-# Visualize districts in distinct colors. Dots indicate the center
-# ---
+from maps.init_squareland import initialize_map, launch_map_overview
+from model.evaluate import check_connectivity
+from model.loss import LossWeights, compute_total_loss, district_indices_from_masks
+from user_interface.custom_loss_ui import get_loss_weights, launch_loss_weight_sliders
+from user_interface.flip_history_ui import FlipHistoryFrame, launch_flip_history_viewer
 
-    n = district_masks[0].shape[0]
-    district_map = np.zeros((n, n), dtype=np.uint8)
-    for k, mask in enumerate(district_masks):
-        district_map += (mask.astype(np.uint8)) * (k + 1)
 
-    plt.imshow(district_map, cmap='tab20')
-    for center in centers:
-        plt.plot(center[0], center[1], 'ko')
-    #plt.colorbar(label='District ID')
-    plt.title('District Map')
-    plt.show()
-    #plt.close('all')
+def compute_edge_neighbourliness(district_masks, sigma: int = 1) -> np.ndarray:
+    """
+    Score edge pixels by the amount of nearby out-group territory.
+    Only pixels on a district boundary receive non-zero scores.
+    """
 
-def compute_edge_neighbourliness(district_masks, sigma=1):
-    # ---
-    # Compute a matrix indicating how many outgroup neighbors each edge pixel has,
-    # weighted by sigma for diagonal neighbors.
-    #
-    # Parameters:
-    #     district_masks: binary masks for all districts (1=in, 0=out)
-    #     sigma: weighting factor for diagonal neighbors
-    #
-    # Returns:
-    #     neighbourliness: nxn array with values > 0 only at true edges (excluding map boundary)
-    # ---
     n = district_masks[0].shape[0]
     neighbourliness = np.zeros((n, n), dtype=int)
 
-    # Define neighbor kernel with sigma for diagonals, edge kernel to prevent triggering on the side of the map rather than border between districts
-    neighbor_kernel = np.array([[sigma, 4, sigma],
-                                [4,   0, 4],
-                                [sigma, 4, sigma]])
+    neighbor_kernel = np.array(
+        [
+            [sigma, 4, sigma],
+            [4, 0, 4],
+            [sigma, 4, sigma],
+        ]
+    )
+    edge_kernel = np.array(
+        [
+            [1, 1, 1],
+            [1, -8, 1],
+            [1, 1, 1],
+        ]
+    )
 
-    edge_kernel = np.array([[1, 1, 1],
-                            [1, -8, 1],
-                            [1, 1, 1]])
-
-    # Only keep neighbourliness where this district has a true edge
     for mask in district_masks:
-        edge_map = convolve2d(mask, edge_kernel, mode='same', boundary='fill', fillvalue=0)
-        edge_mask = (edge_map < 0)
+        edge_map = convolve2d(mask, edge_kernel, mode="same", boundary="fill", fillvalue=0)
+        edge_mask = edge_map < 0
         outgroup_mask = 1 - mask
-        weighted_neighbors = convolve2d(outgroup_mask, neighbor_kernel, mode='same', boundary='fill', fillvalue=0)
+        weighted_neighbors = convolve2d(
+            outgroup_mask,
+            neighbor_kernel,
+            mode="same",
+            boundary="fill",
+            fillvalue=0,
+        )
         neighbourliness += edge_mask * weighted_neighbors
 
     return neighbourliness
 
-def select_candidate(neighbourliness):
-    # ---
-    # Select a random non-zero element from the neighbourliness map.
-    # Returns its coordinates and value.
-    # ---
+
+def select_candidate(neighbourliness: np.ndarray) -> tuple[int, int] | None:
     nonzero_coords = np.argwhere(neighbourliness > 0)
     if len(nonzero_coords) == 0:
-        return None, None  # No edge candidates
+        return None
     candidate_idx = np.random.choice(len(nonzero_coords))
-    candidate = tuple(nonzero_coords[candidate_idx])
-    return candidate, neighbourliness[candidate]
+    row, col = nonzero_coords[candidate_idx]
+    return int(row), int(col)
 
 
-def flip(candidate, candidate_score, district_masks):
-    # """
-    # Attempt to flip the candidate pixel based on its neighbourliness score.
-    # Ensures that the flip does not break district continuity.
-    # """
-    flip_chance = determine_flip_probability(candidate_score)
-    if np.random.rand() > flip_chance:
-        print(f"Flip rejected: candidate {candidate} (score {candidate_score:.3f})")
-        return district_masks
+def get_current_district(candidate: tuple[int, int], district_masks) -> int | None:
+    row, col = candidate
+    return next((idx for idx, mask in enumerate(district_masks) if mask[row, col]), None)
 
-    print(f"Flip accepted: candidate {candidate} (score {candidate_score:.3f})")
 
-    # Determine which district(s) the candidate borders
-    i, j = candidate
-    neighbor_ids = []
-    for k, mask in enumerate(district_masks):
-        neighborhood = mask[max(0, i - 1):i + 2, max(0, j - 1):j + 2]
-        if np.any(neighborhood == 1):
-            neighbor_ids.append(k)
+def get_adjacent_district_ids(candidate: tuple[int, int], district_masks) -> list[int]:
+    row, col = candidate
+    nrows, ncols = district_masks[0].shape
+    adjacent_ids: set[int] = set()
 
-    # Identify current district and exclude from flip targets
-    current_district = next((k for k, mask in enumerate(district_masks) if mask[i, j] == 1), None)
-    # Filter out the current district so we only flip into a different one
-    neighbor_ids = [k for k in neighbor_ids if k != current_district]
-    if not neighbor_ids:
-        print("No adjacent district found to flip into.")
-        return district_masks
+    for next_row, next_col in (
+        (row - 1, col),
+        (row + 1, col),
+        (row, col - 1),
+        (row, col + 1),
+    ):
+        if not (0 <= next_row < nrows and 0 <= next_col < ncols):
+            continue
+        for district_id, mask in enumerate(district_masks):
+            if mask[next_row, next_col]:
+                adjacent_ids.add(district_id)
+                break
 
-    # Pick one at random for now
-    target_district = np.random.choice(neighbor_ids)
+    current_district = get_current_district(candidate, district_masks)
+    if current_district is not None and current_district in adjacent_ids:
+        adjacent_ids.remove(current_district)
 
-    # Identify the current district of the candidate
-    current_district = next((k for k, mask in enumerate(district_masks) if mask[i, j] == 1), None)
-    if current_district is None:
-        print("Candidate not in any district.")
-        return district_masks
+    return sorted(adjacent_ids)
 
-    # Create a tentative update of the masks
+
+def build_proposed_masks(
+    district_masks,
+    candidate: tuple[int, int],
+    current_district: int,
+    target_district: int,
+):
+    row, col = candidate
     new_masks = district_masks.copy()
     new_masks[current_district] = new_masks[current_district].copy()
     new_masks[target_district] = new_masks[target_district].copy()
-    new_masks[current_district][i, j] = 0
-    new_masks[target_district][i, j] = 1
-
-    if not continuity_check_and_evaluate(candidate, current_district, target_district, new_masks):
-        return district_masks
+    new_masks[current_district][row, col] = 0
+    new_masks[target_district][row, col] = 1
     return new_masks
-    gc.collect()
 
-def determine_flip_probability(candidate_score, max_score=20.0):
-    if candidate_score <= 0:
-        return 0.0
-    if candidate_score >= max_score:
+
+def sigmoid(value: float) -> float:
+    if value >= 0:
+        exp_term = math.exp(-value)
+        return 1.0 / (1.0 + exp_term)
+    exp_term = math.exp(value)
+    return exp_term / (1.0 + exp_term)
+
+
+def acceptance_probability(loss_delta: float, temperature: float) -> float:
+    if loss_delta <= 0:
         return 1.0
-    return candidate_score / max_score
-
-def continuity_check_and_evaluate(candidate, current_district, target_district, new_masks):
-    if not (check_connectivity(new_masks[current_district]) and check_connectivity(new_masks[target_district])):
-        print("Flip would break district continuity. Rejected.")
-        return False
-    print(f"Flip confirmed: pixel {candidate} moved from district {current_district} to {target_district}.")
-    evaluate_flip(candidate, target_district)
-    return True
+    return sigmoid(temperature / loss_delta)
 
 
-def update(frame):
-    print(f"Frame {frame}")
-    nonlocal district_masks
-    neighbourliness = compute_edge_neighbourliness(district_masks)
-    candidate, score = select_candidate(neighbourliness)
-    if candidate:
-        district_masks = flip(candidate, score, district_masks)
-        updated_map = np.zeros_like(district_masks[0], dtype=np.uint8)
-        for k, mask in enumerate(district_masks):
-            updated_map += mask.astype(np.uint8) * (k + 1)
-        im.set_data(updated_map)
-    return [im]
+def prompt_yes_no(prompt: str) -> bool:
+    while True:
+        response = input(prompt).strip().lower()
+        if response in {"y", "yes"}:
+            return True
+        if response in {"n", "no"}:
+            return False
+        print("Please answer 'y' or 'n'.")
 
-def main():
-    _, _, district_masks, centers = initialize_map()
-    n_flips = 50  # or however many you want
 
-    for _ in range(n_flips):
+def prompt_int(prompt: str, default: int) -> int:
+    while True:
+        response = input(prompt).strip()
+        if not response:
+            return default
+        try:
+            value = int(response)
+        except ValueError:
+            print("Please enter a whole number.")
+            continue
+        if value <= 0:
+            print("Please enter a positive whole number.")
+            continue
+        return value
+
+
+def prompt_float(prompt: str, default: float) -> float:
+    while True:
+        response = input(prompt).strip()
+        if not response:
+            return default
+        try:
+            return float(response)
+        except ValueError:
+            print("Please enter a number.")
+
+
+def prompt_for_loss_weights() -> LossWeights:
+    current_weights = get_loss_weights()
+
+    while True:
+        fig, sliders = launch_loss_weight_sliders(initial=current_weights)
+        plt.show()
+        # Keep widget references alive until the window closes.
+        del fig, sliders
+        current_weights = get_loss_weights()
+
+        print("\nCurrent loss weights:")
+        for key, value in asdict(current_weights).items():
+            print(f"  {key}: {value}")
+
+        if prompt_yes_no("Use these weights? [y/n]: "):
+            return current_weights
+
+
+def capture_flip_history_frame(
+    district_masks,
+    accepted_flips: int,
+    attempts: int,
+    total_loss: float,
+    loss_delta: float,
+    candidate: tuple[int, int] | None = None,
+    current_district: int | None = None,
+    target_district: int | None = None,
+) -> FlipHistoryFrame:
+    return FlipHistoryFrame(
+        labels=district_indices_from_masks(district_masks).copy(),
+        accepted_flips=accepted_flips,
+        attempts=attempts,
+        total_loss=total_loss,
+        loss_delta=loss_delta,
+        candidate=candidate,
+        current_district=current_district,
+        target_district=target_district,
+    )
+
+
+def run_monte_carlo(
+    pops: np.ndarray,
+    swing: np.ndarray,
+    district_masks,
+    weights: LossWeights,
+    successful_flips_target: int,
+    temperature: float,
+):
+    current_loss = compute_total_loss(pops, swing, district_masks, weights=weights)
+    accepted_flips = 0
+    attempts = 0
+    history_frames = [
+        capture_flip_history_frame(
+            district_masks=district_masks,
+            accepted_flips=accepted_flips,
+            attempts=attempts,
+            total_loss=current_loss,
+            loss_delta=0.0,
+        )
+    ]
+
+    print(f"\nInitial total loss: {current_loss:.6f}")
+
+    while accepted_flips < successful_flips_target:
+        attempts += 1
+
         neighbourliness = compute_edge_neighbourliness(district_masks)
-        candidate, score = select_candidate(neighbourliness)
-        if candidate:
-            district_masks = flip(candidate, score, district_masks)
-            visualize_districts(district_masks, centers)
-            plt.show()
-            #plt.close()  # clean up memory
+        candidate = select_candidate(neighbourliness)
+        if candidate is None:
+            raise RuntimeError("No valid edge candidates remain.")
 
-if __name__ == '__main__':
+        current_district = get_current_district(candidate, district_masks)
+        if current_district is None:
+            continue
+
+        target_options = get_adjacent_district_ids(candidate, district_masks)
+        if not target_options:
+            continue
+
+        target_district = int(np.random.choice(target_options))
+        proposed_masks = build_proposed_masks(
+            district_masks=district_masks,
+            candidate=candidate,
+            current_district=current_district,
+            target_district=target_district,
+        )
+
+        if not (
+            check_connectivity(proposed_masks[current_district])
+            and check_connectivity(proposed_masks[target_district])
+        ):
+            continue
+
+        proposed_loss = compute_total_loss(pops, swing, proposed_masks, weights=weights)
+        loss_delta = proposed_loss - current_loss
+        accept_probability = acceptance_probability(loss_delta, temperature)
+
+        if loss_delta <= 0 or np.random.random() < accept_probability:
+            district_masks = proposed_masks
+            current_loss = proposed_loss
+            accepted_flips += 1
+            history_frames.append(
+                capture_flip_history_frame(
+                    district_masks=district_masks,
+                    accepted_flips=accepted_flips,
+                    attempts=attempts,
+                    total_loss=current_loss,
+                    loss_delta=loss_delta,
+                    candidate=candidate,
+                    current_district=current_district,
+                    target_district=target_district,
+                )
+            )
+            print(
+                f"Accepted {accepted_flips}/{successful_flips_target} "
+                f"after attempt {attempts}: pixel {candidate} "
+                f"{current_district}->{target_district}, "
+                f"delta={loss_delta:.6f}, total={current_loss:.6f}, "
+                f"p={accept_probability:.6f}"
+            )
+
+    print(f"\nCompleted {accepted_flips} accepted flips in {attempts} attempts.")
+    print(f"Final total loss: {current_loss:.6f}")
+    return district_masks, current_loss, history_frames
+
+
+def main() -> None:
+    pops, swing, district_masks, centers = initialize_map()
+    overview_fig, overview_axes = launch_map_overview(
+        pops=pops,
+        swing=swing,
+        district_masks=district_masks,
+        centers=centers,
+    )
+    plt.show()
+    del overview_fig, overview_axes
+
+    weights = prompt_for_loss_weights()
+    successful_flips_target = prompt_int("Number of accepted flips to complete [10]: ", default=10)
+    temperature = prompt_float("Temperature for uphill moves [1.0]: ", default=1.0)
+
+    _, _, history_frames = run_monte_carlo(
+        pops=pops,
+        swing=swing,
+        district_masks=district_masks,
+        weights=weights,
+        successful_flips_target=successful_flips_target,
+        temperature=temperature,
+    )
+
+    history_fig, history_slider = launch_flip_history_viewer(
+        pops=pops,
+        swing=swing,
+        frames=history_frames,
+    )
+    plt.show()
+    del history_fig, history_slider
+
+
+if __name__ == "__main__":
     main()

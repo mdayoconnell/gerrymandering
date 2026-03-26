@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import asdict
-import math
+from datetime import datetime
+import json
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import convolve2d
 
-from maps.init_squareland import initialize_map, launch_map_overview
+from maps import init_rectangleland, init_squareland
 from model.evaluate import check_connectivity
 from model.loss import LossWeights, compute_total_loss, district_indices_from_masks
-from user_interface.custom_loss_ui import get_loss_weights, launch_loss_weight_sliders
-from user_interface.flip_history_ui import FlipHistoryFrame, launch_flip_history_viewer
+from user_interface.custom_loss_ui import (
+    get_loss_weights,
+    get_uphill_move_probability,
+    launch_loss_weight_sliders,
+)
+from user_interface.flip_history_ui import (
+    FlipHistoryFrame,
+    export_flip_history_movie,
+    launch_flip_history_viewer,
+)
 
 
 def compute_edge_neighbourliness(district_masks, sigma: int = 1) -> np.ndarray:
@@ -108,18 +119,10 @@ def build_proposed_masks(
     return new_masks
 
 
-def sigmoid(value: float) -> float:
-    if value >= 0:
-        exp_term = math.exp(-value)
-        return 1.0 / (1.0 + exp_term)
-    exp_term = math.exp(value)
-    return exp_term / (1.0 + exp_term)
-
-
-def acceptance_probability(loss_delta: float, temperature: float) -> float:
+def acceptance_probability(loss_delta: float, uphill_move_probability: float) -> float:
     if loss_delta <= 0:
         return 1.0
-    return sigmoid(temperature / loss_delta)
+    return float(np.clip(uphill_move_probability, 0.0, 1.0))
 
 
 def prompt_yes_no(prompt: str) -> bool:
@@ -148,33 +151,78 @@ def prompt_int(prompt: str, default: int) -> int:
         return value
 
 
-def prompt_float(prompt: str, default: float) -> float:
-    while True:
-        response = input(prompt).strip()
-        if not response:
-            return default
-        try:
-            return float(response)
-        except ValueError:
-            print("Please enter a number.")
-
-
-def prompt_for_loss_weights() -> LossWeights:
+def prompt_for_run_controls() -> tuple[LossWeights, float]:
     current_weights = get_loss_weights()
+    current_uphill_move_probability = get_uphill_move_probability()
 
     while True:
-        fig, sliders = launch_loss_weight_sliders(initial=current_weights)
+        fig, sliders = launch_loss_weight_sliders(
+            initial=current_weights,
+            initial_uphill_move_probability=current_uphill_move_probability,
+        )
         plt.show()
         # Keep widget references alive until the window closes.
         del fig, sliders
         current_weights = get_loss_weights()
+        current_uphill_move_probability = get_uphill_move_probability()
 
         print("\nCurrent loss weights:")
         for key, value in asdict(current_weights).items():
             print(f"  {key}: {value}")
+        print(f"  uphill_move_probability: {current_uphill_move_probability}")
 
-        if prompt_yes_no("Use these weights? [y/n]: "):
-            return current_weights
+        if prompt_yes_no("Use these settings? [y/n]: "):
+            return current_weights, current_uphill_move_probability
+
+
+def _artifacts_dir() -> Path:
+    artifacts_dir = Path(__file__).resolve().parent / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    return artifacts_dir
+
+
+def write_run_specs_artifact(
+    *,
+    timestamp: str,
+    map_name: str,
+    n: int,
+    num_districts: int,
+    num_cities: int,
+    num_farms: int,
+    require_continuity: bool,
+    weights: LossWeights,
+    successful_flips_target: int,
+    uphill_move_probability: float,
+    pops: np.ndarray,
+    swing: np.ndarray,
+    history_frames: list[FlipHistoryFrame],
+    video_filename: str,
+) -> Path:
+    specs_path = _artifacts_dir() / f"run_specs_{timestamp}.json"
+    payload = {
+        "title": f"gerrymandering_run_{timestamp}",
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "map": map_name,
+        "n": n,
+        "num_districts": num_districts,
+        "num_cities": num_cities,
+        "num_farms": num_farms,
+        "require_continuity": require_continuity,
+        "successful_flips_target": successful_flips_target,
+        "uphill_move_probability": uphill_move_probability,
+        "weights": asdict(weights),
+        "grid_shape": [int(pops.shape[0]), int(pops.shape[1])],
+        "total_population": float(np.sum(pops)),
+        "swing_range": [float(np.min(swing)), float(np.max(swing))],
+        "frame_count": len(history_frames),
+        "accepted_flips": int(history_frames[-1].accepted_flips),
+        "attempts": int(history_frames[-1].attempts),
+        "initial_total_loss": float(history_frames[0].total_loss),
+        "final_total_loss": float(history_frames[-1].total_loss),
+        "video_filename": video_filename,
+    }
+    specs_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return specs_path
 
 
 def capture_flip_history_frame(
@@ -205,11 +253,17 @@ def run_monte_carlo(
     district_masks,
     weights: LossWeights,
     successful_flips_target: int,
-    temperature: float,
+    uphill_move_probability: float,
+    require_continuity: bool = True,
+    max_attempts_without_accept: int | None = None,
 ):
     current_loss = compute_total_loss(pops, swing, district_masks, weights=weights)
     accepted_flips = 0
     attempts = 0
+    attempts_since_accept = 0
+    if max_attempts_without_accept is None:
+        max_attempts_without_accept = max(2000, 200 * successful_flips_target, 400 * len(district_masks))
+
     history_frames = [
         capture_flip_history_frame(
             district_masks=district_masks,
@@ -221,73 +275,125 @@ def run_monte_carlo(
     ]
 
     print(f"\nInitial total loss: {current_loss:.6f}")
+    stop_reason: str | None = None
 
-    while accepted_flips < successful_flips_target:
-        attempts += 1
+    try:
+        while accepted_flips < successful_flips_target:
+            attempts += 1
+            attempts_since_accept += 1
 
-        neighbourliness = compute_edge_neighbourliness(district_masks)
-        candidate = select_candidate(neighbourliness)
-        if candidate is None:
-            raise RuntimeError("No valid edge candidates remain.")
+            neighbourliness = compute_edge_neighbourliness(district_masks)
+            candidate = select_candidate(neighbourliness)
+            if candidate is None:
+                stop_reason = "No valid edge candidates remain."
+                break
 
-        current_district = get_current_district(candidate, district_masks)
-        if current_district is None:
-            continue
+            current_district = get_current_district(candidate, district_masks)
+            if current_district is None:
+                if attempts_since_accept >= max_attempts_without_accept:
+                    stop_reason = (
+                        f"Stopping early after {attempts_since_accept} consecutive attempts without an accepted flip."
+                    )
+                    break
+                continue
 
-        target_options = get_adjacent_district_ids(candidate, district_masks)
-        if not target_options:
-            continue
+            target_options = get_adjacent_district_ids(candidate, district_masks)
+            if not target_options:
+                if attempts_since_accept >= max_attempts_without_accept:
+                    stop_reason = (
+                        f"Stopping early after {attempts_since_accept} consecutive attempts without an accepted flip."
+                    )
+                    break
+                continue
 
-        target_district = int(np.random.choice(target_options))
-        proposed_masks = build_proposed_masks(
-            district_masks=district_masks,
-            candidate=candidate,
-            current_district=current_district,
-            target_district=target_district,
+            target_district = int(np.random.choice(target_options))
+            proposed_masks = build_proposed_masks(
+                district_masks=district_masks,
+                candidate=candidate,
+                current_district=current_district,
+                target_district=target_district,
+            )
+
+            if require_continuity and not (
+                check_connectivity(proposed_masks[current_district])
+                and check_connectivity(proposed_masks[target_district])
+            ):
+                if attempts_since_accept >= max_attempts_without_accept:
+                    stop_reason = (
+                        f"Stopping early after {attempts_since_accept} consecutive attempts without an accepted flip."
+                    )
+                    break
+                continue
+
+            proposed_loss = compute_total_loss(pops, swing, proposed_masks, weights=weights)
+            loss_delta = proposed_loss - current_loss
+            accept_probability = acceptance_probability(loss_delta, uphill_move_probability)
+
+            if loss_delta <= 0 or np.random.random() < accept_probability:
+                district_masks = proposed_masks
+                current_loss = proposed_loss
+                accepted_flips += 1
+                attempts_since_accept = 0
+                history_frames.append(
+                    capture_flip_history_frame(
+                        district_masks=district_masks,
+                        accepted_flips=accepted_flips,
+                        attempts=attempts,
+                        total_loss=current_loss,
+                        loss_delta=loss_delta,
+                        candidate=candidate,
+                        current_district=current_district,
+                        target_district=target_district,
+                    )
+                )
+                print(
+                    f"Accepted {accepted_flips}/{successful_flips_target} "
+                    f"after attempt {attempts}: pixel {candidate} "
+                    f"{current_district}->{target_district}, "
+                    f"delta={loss_delta:.6f}, total={current_loss:.6f}, "
+                    f"p={accept_probability:.6f}"
+                )
+            elif attempts_since_accept >= max_attempts_without_accept:
+                stop_reason = (
+                    f"Stopping early after {attempts_since_accept} consecutive attempts without an accepted flip. "
+                    "Likely reached a local minimum at the current uphill-move probability."
+                )
+                break
+    except KeyboardInterrupt:
+        stop_reason = (
+            f"Interrupted by user after {attempts} attempts. "
+            "Returning the history collected so far."
         )
 
-        if not (
-            check_connectivity(proposed_masks[current_district])
-            and check_connectivity(proposed_masks[target_district])
-        ):
-            continue
+    if stop_reason is not None:
+        print(f"\n{stop_reason}")
+        print(f"Accepted {accepted_flips}/{successful_flips_target} flips before stopping.")
 
-        proposed_loss = compute_total_loss(pops, swing, proposed_masks, weights=weights)
-        loss_delta = proposed_loss - current_loss
-        accept_probability = acceptance_probability(loss_delta, temperature)
-
-        if loss_delta <= 0 or np.random.random() < accept_probability:
-            district_masks = proposed_masks
-            current_loss = proposed_loss
-            accepted_flips += 1
-            history_frames.append(
-                capture_flip_history_frame(
-                    district_masks=district_masks,
-                    accepted_flips=accepted_flips,
-                    attempts=attempts,
-                    total_loss=current_loss,
-                    loss_delta=loss_delta,
-                    candidate=candidate,
-                    current_district=current_district,
-                    target_district=target_district,
-                )
-            )
-            print(
-                f"Accepted {accepted_flips}/{successful_flips_target} "
-                f"after attempt {attempts}: pixel {candidate} "
-                f"{current_district}->{target_district}, "
-                f"delta={loss_delta:.6f}, total={current_loss:.6f}, "
-                f"p={accept_probability:.6f}"
-            )
-
-    print(f"\nCompleted {accepted_flips} accepted flips in {attempts} attempts.")
+    if accepted_flips >= successful_flips_target:
+        print(f"\nCompleted {accepted_flips} accepted flips in {attempts} attempts.")
+    else:
+        print(f"\nFinished with {accepted_flips} accepted flips in {attempts} attempts.")
     print(f"Final total loss: {current_loss:.6f}")
     return district_masks, current_loss, history_frames
 
 
-def main() -> None:
-    pops, swing, district_masks, centers = initialize_map()
-    overview_fig, overview_axes = launch_map_overview(
+def main(
+    map_name: str = "squareland",
+    require_continuity: bool = True,
+    n: int = 25,
+    num_districts: int = 5,
+    num_cities: int = 2,
+    num_farms: int = 4,
+) -> None:
+    map_module = init_squareland if map_name == "squareland" else init_rectangleland
+
+    pops, swing, district_masks, centers = map_module.initialize_map(
+        n=n,
+        num_districts=num_districts,
+        num_cities=num_cities,
+        num_farms=num_farms,
+    )
+    overview_fig, overview_axes = map_module.launch_map_overview(
         pops=pops,
         swing=swing,
         district_masks=district_masks,
@@ -296,9 +402,9 @@ def main() -> None:
     plt.show()
     del overview_fig, overview_axes
 
-    weights = prompt_for_loss_weights()
+    weights, uphill_move_probability = prompt_for_run_controls()
     successful_flips_target = prompt_int("Number of accepted flips to complete [10]: ", default=10)
-    temperature = prompt_float("Temperature for uphill moves [1.0]: ", default=1.0)
+    print("Press Ctrl+C during the Monte Carlo run to stop early and open the history viewer with partial results.")
 
     _, _, history_frames = run_monte_carlo(
         pops=pops,
@@ -306,7 +412,8 @@ def main() -> None:
         district_masks=district_masks,
         weights=weights,
         successful_flips_target=successful_flips_target,
-        temperature=temperature,
+        uphill_move_probability=uphill_move_probability,
+        require_continuity=require_continuity,
     )
 
     history_fig, history_slider = launch_flip_history_viewer(
@@ -317,6 +424,64 @@ def main() -> None:
     plt.show()
     del history_fig, history_slider
 
+    if prompt_yes_no("Export as video? [y/n]: "):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        video_path = _artifacts_dir() / f"flip_history_{timestamp}.mov"
+        specs_path = write_run_specs_artifact(
+            timestamp=timestamp,
+            map_name=map_name,
+            n=n,
+            num_districts=num_districts,
+            num_cities=num_cities,
+            num_farms=num_farms,
+            require_continuity=require_continuity,
+            weights=weights,
+            successful_flips_target=successful_flips_target,
+            uphill_move_probability=uphill_move_probability,
+            pops=pops,
+            swing=swing,
+            history_frames=history_frames,
+            video_filename=video_path.name,
+        )
+        print(f"Wrote run specs to {specs_path}")
+        try:
+            export_flip_history_movie(
+                pops=pops,
+                swing=swing,
+                frames=history_frames,
+                output_path=video_path,
+            )
+        except RuntimeError as exc:
+            print(f"Video export failed: {exc}")
+        else:
+            print(f"Wrote video to {video_path}")
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run the gerrymandering simulation.")
+    parser.add_argument(
+        "--map",
+        choices=("squareland", "rectangleland"),
+        default="squareland",
+        help="Choose which map to initialize.",
+    )
+    parser.add_argument("--n", type=int, default=25, help="Map width and height in cells.")
+    parser.add_argument("--num-districts", type=int, default=5, help="Number of districts.")
+    parser.add_argument("--num-cities", type=int, default=2, help="Number of city centers.")
+    parser.add_argument("--num-farms", type=int, default=4, help="Number of farm centers.")
+    parser.add_argument(
+        "--require-continuity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require both affected districts to remain contiguous before accepting a flip.",
+    )
+    args = parser.parse_args()
+
+    main(
+        map_name=args.map,
+        require_continuity=args.require_continuity,
+        n=args.n,
+        num_districts=args.num_districts,
+        num_cities=args.num_cities,
+        num_farms=args.num_farms,
+    )

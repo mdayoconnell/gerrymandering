@@ -6,8 +6,8 @@ from typing import Literal, Mapping, Sequence
 import numpy as np
 
 PreferredParty = Literal["blue", "red"]
-ElectionMetric = Literal["seat_share", "mean_margin", "hybrid"]
-BalanceMetric = Literal["mae", "rmse", "max"]
+ElectionMetric = Literal["seat_share", "mean_margin", "hybrid", "tipping_band"]
+BalanceMetric = Literal["mae", "rmse", "max", "kurtosis"]
 
 _EPS = 1e-12
 
@@ -49,8 +49,10 @@ class FaultToleranceConfig:
 @dataclass(frozen=True)
 class LossConfig:
     preferred_party: PreferredParty | None = None
-    election_metric: ElectionMetric = "hybrid"
-    balance_metric: BalanceMetric = "mae"
+    election_metric: ElectionMetric = "tipping_band"
+    progress_tau: float = 0.10
+    tipping_band_radius: int = 1
+    balance_metric: BalanceMetric = "kurtosis"
     fault_tolerance: FaultToleranceConfig = field(default_factory=FaultToleranceConfig)
 
 
@@ -141,15 +143,22 @@ def compute_loss_breakdown(
 
     preferred_party = cfg.preferred_party or ("blue" if w.election_outcome >= 0.0 else "red")
     election_outcome_loss = _election_outcome_loss(
+        district_pop=district_pop,
         district_mean_swing=district_mean_swing,
         preferred_party=preferred_party,
         metric=cfg.election_metric,
+        progress_tau=cfg.progress_tau,
+        tipping_band_radius=cfg.tipping_band_radius,
     )
     fault_tolerance_loss = _fault_tolerance_loss(
         district_mean_swing=district_mean_swing,
         cfg=cfg.fault_tolerance,
     )
-    district_cleanliness_loss = _district_cleanliness_loss(mask_stack)
+    district_cleanliness_loss = _district_cleanliness_loss(
+        labels=labels,
+        pops=pops_arr,
+        num_districts=mask_stack.shape[0],
+    )
     district_balance_loss = _district_balance_loss(
         district_pop=district_pop,
         metric=cfg.balance_metric,
@@ -269,19 +278,17 @@ def _district_stats_from_labels(
 
 
 def _election_outcome_loss(
+    district_pop: np.ndarray,
     district_mean_swing: np.ndarray,
     preferred_party: PreferredParty,
     metric: ElectionMetric,
+    progress_tau: float,
+    tipping_band_radius: int,
 ) -> float:
     if district_mean_swing.size == 0:
         return 1.0
 
-    if preferred_party == "blue":
-        preferred_wins = district_mean_swing > 0.0
-        signed_margin = district_mean_swing
-    else:
-        preferred_wins = district_mean_swing <= 0.0
-        signed_margin = -district_mean_swing
+    signed_margin, preferred_wins = _preferred_party_view(district_mean_swing, preferred_party)
 
     seat_share_loss = 1.0 - float(np.mean(preferred_wins))
     margin_loss = 0.5 * (1.0 - float(np.mean(np.clip(signed_margin, -1.0, 1.0))))
@@ -293,7 +300,80 @@ def _election_outcome_loss(
     if metric == "hybrid":
         # Seat wins matter most, but margin discourages razor-thin maps.
         return float(np.clip(0.8 * seat_share_loss + 0.2 * margin_loss, 0.0, 1.0))
+    if metric == "tipping_band":
+        return _tipping_band_loss(
+            district_pop=district_pop,
+            signed_margin=signed_margin,
+            tau=progress_tau,
+            band_radius=tipping_band_radius,
+        )
     raise ValueError(f"Unsupported election metric: {metric}")
+
+
+def _preferred_party_view(
+    district_mean_swing: np.ndarray,
+    preferred_party: PreferredParty,
+) -> tuple[np.ndarray, np.ndarray]:
+    if preferred_party == "blue":
+        signed_margin = np.asarray(district_mean_swing, dtype=float)
+        preferred_wins = signed_margin > 0.0
+    else:
+        signed_margin = -np.asarray(district_mean_swing, dtype=float)
+        # Preserve the legacy convention where ties break toward red.
+        preferred_wins = signed_margin >= 0.0
+
+    return signed_margin, preferred_wins
+
+
+def _tipping_band_loss(
+    district_pop: np.ndarray,
+    signed_margin: np.ndarray,
+    tau: float,
+    band_radius: int,
+) -> float:
+    electoral_weight = _normalized_electoral_weights(district_pop)
+    sort_order = np.argsort(-np.asarray(signed_margin, dtype=float))
+    sorted_margin = np.asarray(signed_margin, dtype=float)[sort_order]
+    sorted_weight = electoral_weight[sort_order]
+    num_districts = sorted_margin.size
+    if num_districts == 0:
+        return 1.0
+
+    cumulative_weight = np.cumsum(sorted_weight)
+    decisive_idx = int(np.searchsorted(cumulative_weight, 0.5, side="left"))
+    decisive_idx = min(decisive_idx, num_districts - 1)
+    radius = max(int(band_radius), 0)
+
+    start = max(0, decisive_idx - radius)
+    stop = min(num_districts, decisive_idx + radius + 1)
+    band_indices = np.arange(start, stop)
+    proximity_weight = (radius + 1) - np.abs(band_indices - decisive_idx)
+    weights = proximity_weight * sorted_weight[start:stop]
+    if not np.any(weights > 0.0):
+        weights = proximity_weight.astype(float)
+    tip_margin = float(np.average(sorted_margin[start:stop], weights=weights))
+
+    tau_value = max(float(tau), _EPS)
+    return _sigmoid(-tip_margin / tau_value)
+
+
+def _normalized_electoral_weights(district_pop: np.ndarray) -> np.ndarray:
+    pop = np.asarray(district_pop, dtype=float)
+    total_pop = float(np.sum(pop))
+    num_districts = pop.size
+    if num_districts == 0:
+        return pop
+    if total_pop <= _EPS:
+        return np.full(num_districts, 1.0 / float(num_districts), dtype=float)
+    return pop / total_pop
+
+
+def _sigmoid(value: float) -> float:
+    if value >= 0.0:
+        exp_term = float(np.exp(-value))
+        return float(1.0 / (1.0 + exp_term))
+    exp_term = float(np.exp(value))
+    return float(exp_term / (1.0 + exp_term))
 
 
 def _fault_tolerance_loss(district_mean_swing: np.ndarray, cfg: FaultToleranceConfig) -> float:
@@ -325,34 +405,79 @@ def _fault_tolerance_loss(district_mean_swing: np.ndarray, cfg: FaultToleranceCo
     return float(np.clip(combined, 0.0, 1.0))
 
 
-def _district_cleanliness_loss(mask_stack: np.ndarray) -> float:
-    per_district_losses: list[float] = []
-    for mask in mask_stack:
-        area = float(np.count_nonzero(mask))
-        if area <= 0.0:
-            per_district_losses.append(1.0)
-            continue
+def _district_cleanliness_loss(
+    labels: np.ndarray,
+    pops: np.ndarray,
+    num_districts: int,
+) -> float:
+    valid = labels >= 0
+    if not np.any(valid):
+        return 1.0
 
-        perimeter = _grid_perimeter(mask)
-        compactness = (4.0 * np.pi * area) / ((perimeter * perimeter) + _EPS)
-        compactness = float(np.clip(compactness, 0.0, 1.0))
-        per_district_losses.append(1.0 - compactness)
-
-    return float(np.mean(per_district_losses))
-
-
-def _grid_perimeter(mask: np.ndarray) -> float:
-    mask_u = np.asarray(mask, dtype=np.uint8)
-    padded = np.pad(mask_u, ((1, 1), (1, 1)), mode="constant")
-    center = padded[1:-1, 1:-1]
-
-    perimeter = (
-        np.sum(center * (1 - padded[:-2, 1:-1]))
-        + np.sum(center * (1 - padded[2:, 1:-1]))
-        + np.sum(center * (1 - padded[1:-1, :-2]))
-        + np.sum(center * (1 - padded[1:-1, 2:]))
+    centers, active_districts = _district_population_centers(
+        labels=labels,
+        pops=pops,
+        num_districts=num_districts,
     )
-    return float(perimeter)
+    if not np.any(active_districts):
+        return 1.0
+
+    row_coords, col_coords = np.indices(labels.shape, dtype=float)
+    flat_labels = labels[valid].ravel()
+    flat_rows = row_coords[valid].ravel()[:, None]
+    flat_cols = col_coords[valid].ravel()[:, None]
+
+    active_centers = centers[active_districts]
+    active_ids = np.flatnonzero(active_districts)
+    dist_sq = (flat_rows - active_centers[:, 0]) ** 2 + (flat_cols - active_centers[:, 1]) ** 2
+    voronoi_labels = active_ids[np.argmin(dist_sq, axis=1)]
+
+    mismatch_rate = np.mean(voronoi_labels != flat_labels)
+    return float(mismatch_rate)
+
+
+def _district_population_centers(
+    labels: np.ndarray,
+    pops: np.ndarray,
+    num_districts: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    valid = labels >= 0
+    centers = np.full((num_districts, 2), np.nan, dtype=float)
+    active_districts = np.zeros(num_districts, dtype=bool)
+    if not np.any(valid):
+        return centers, active_districts
+
+    row_coords, col_coords = np.indices(labels.shape, dtype=float)
+    flat_labels = labels[valid].ravel()
+    flat_rows = row_coords[valid].ravel()
+    flat_cols = col_coords[valid].ravel()
+    flat_pops = pops[valid].ravel()
+
+    district_area = np.bincount(flat_labels, minlength=num_districts).astype(float)
+    district_pop = np.bincount(flat_labels, weights=flat_pops, minlength=num_districts).astype(float)
+    weighted_row_sum = np.bincount(
+        flat_labels,
+        weights=flat_rows * flat_pops,
+        minlength=num_districts,
+    ).astype(float)
+    weighted_col_sum = np.bincount(
+        flat_labels,
+        weights=flat_cols * flat_pops,
+        minlength=num_districts,
+    ).astype(float)
+    geom_row_sum = np.bincount(flat_labels, weights=flat_rows, minlength=num_districts).astype(float)
+    geom_col_sum = np.bincount(flat_labels, weights=flat_cols, minlength=num_districts).astype(float)
+
+    active_districts = district_area > 0.0
+    pop_weighted = district_pop > _EPS
+    centers[pop_weighted, 0] = weighted_row_sum[pop_weighted] / district_pop[pop_weighted]
+    centers[pop_weighted, 1] = weighted_col_sum[pop_weighted] / district_pop[pop_weighted]
+
+    zero_pop = active_districts & ~pop_weighted
+    centers[zero_pop, 0] = geom_row_sum[zero_pop] / district_area[zero_pop]
+    centers[zero_pop, 1] = geom_col_sum[zero_pop] / district_area[zero_pop]
+
+    return centers, active_districts
 
 
 def _district_balance_loss(district_pop: np.ndarray, metric: BalanceMetric) -> float:
@@ -367,7 +492,11 @@ def _district_balance_loss(district_pop: np.ndarray, metric: BalanceMetric) -> f
     ideal = total_pop / float(num_districts)
     rel_dev = np.abs(district_pop - ideal) / (ideal + _EPS)
 
-    if metric == "mae":
+    if metric == "kurtosis":
+        signed_rel_dev = (district_pop - ideal) / (ideal + _EPS)
+        raw = float(np.mean(signed_rel_dev**4))
+        max_raw = (((num_districts - 1.0) ** 4) + (num_districts - 1.0)) / float(num_districts)
+    elif metric == "mae":
         raw = float(np.mean(rel_dev))
         max_raw = 2.0 * (num_districts - 1.0) / float(num_districts)
     elif metric == "rmse":

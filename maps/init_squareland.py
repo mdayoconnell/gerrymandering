@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.collections import LineCollection
 
+from maps.party_visuals import BLUE_PARTY_COLOR, RED_PARTY_COLOR, SWING_CMAP, SWING_TITLE
+
 
 def initialize_map(
     n: int = 25,
@@ -53,7 +55,8 @@ def initialize_map(
         pops = pops / max_pop
 
     # Swing is driven by the same Gaussian centers:
-    # cities vote blue (+), farms vote red (-), then normalize to [-1, 1].
+    # cities vote blue (+), farms vote red (-), then recenter to a tied
+    # statewide popular vote and normalize to [-1, 1].
     swing = np.zeros((n, n), dtype=float)
 
     for cx, cy in city_centers:
@@ -63,6 +66,11 @@ def initialize_map(
     for fx, fy in farm_centers:
         r2 = (I - fx) ** 2 + (J - fy) ** 2
         swing -= np.exp(-r2 / (2.0 * (farm_std**2)))
+
+    total_population = float(np.sum(pops))
+    if total_population > 0:
+        weighted_mean_swing = float(np.sum(pops * swing) / total_population)
+        swing = swing - weighted_mean_swing
 
     max_abs = float(np.max(np.abs(swing)))
     if max_abs > 0:
@@ -162,11 +170,11 @@ def visualize_district_swing(labels: np.ndarray, pops: np.ndarray, swing: np.nda
     district_pop, district_vote, district_mean = compute_district_stats(pops, swing, labels, num_districts)
 
     swing_map = district_mean[labels]  # broadcast district mean to pixels
-    im = ax.imshow(swing_map, cmap="bwr", vmin=-1, vmax=1)
+    im = ax.imshow(swing_map, cmap=SWING_CMAP, vmin=-1, vmax=1)
 
     # centers are (row, col) so plot(col, row)
     ax.plot(centers[:, 1], centers[:, 0], "ko", markersize=4)
-    ax.set_title("District Mean Swing (pop-weighted)")
+    ax.set_title("District Mean Swing (pop-weighted, -1 red, +1 blue)")
     ax.set_xticks([])
     ax.set_yticks([])
 
@@ -238,7 +246,7 @@ def visualize_electoral_college_bar(
         w = int(ev[k])
         if w <= 0:
             continue
-        ax.barh([0], [w], left=left, color="#2b6cb0", edgecolor="k", linewidth=0.6, height=0.6)
+        ax.barh([0], [w], left=left, color=BLUE_PARTY_COLOR, edgecolor="k", linewidth=0.6, height=0.6)
         if show_numbers and w >= 4:
             ax.text(left + w / 2.0, 0, str(w), ha="center", va="center", fontsize=9, color="white")
         left += w
@@ -250,7 +258,7 @@ def visualize_electoral_college_bar(
         w = int(ev[k])
         if w <= 0:
             continue
-        ax.barh([0], [w], left=left, color="#c53030", edgecolor="k", linewidth=0.6, height=0.6)
+        ax.barh([0], [w], left=left, color=RED_PARTY_COLOR, edgecolor="k", linewidth=0.6, height=0.6)
         if show_numbers and w >= 4:
             ax.text(left + w / 2.0, 0, str(w), ha="center", va="center", fontsize=9, color="white")
         left += w
@@ -323,8 +331,8 @@ def launch_map_overview(
     overlay_district_boundaries(population_ax, labels)
     plt.colorbar(population_im, ax=population_ax, fraction=0.046, pad=0.04)
 
-    swing_im = swing_ax.imshow(swing, cmap="bwr", vmin=-1, vmax=1)
-    swing_ax.set_title("Swing (-1 red, +1 blue)")
+    swing_im = swing_ax.imshow(swing, cmap=SWING_CMAP, vmin=-1, vmax=1)
+    swing_ax.set_title(SWING_TITLE)
     swing_ax.set_xticks([])
     swing_ax.set_yticks([])
     overlay_district_boundaries(swing_ax, labels)
@@ -410,8 +418,8 @@ def main(
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
         elif name == "swing":
-            im = ax.imshow(swing, cmap="bwr", vmin=-1, vmax=1)
-            ax.set_title("Swing (-1 red, +1 blue)")
+            im = ax.imshow(swing, cmap=SWING_CMAP, vmin=-1, vmax=1)
+            ax.set_title(SWING_TITLE)
             ax.set_xticks([])
             ax.set_yticks([])
             if overlay_lines_on_swing:
